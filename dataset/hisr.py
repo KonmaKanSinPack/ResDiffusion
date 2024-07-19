@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.utils.data as data
 import torchvision.transforms as T
+import pywt
 import cv2
 import numpy as np
 import h5py
@@ -22,7 +23,11 @@ class Identity:
 class HISRDataSets(data.Dataset):
     # FIXME: when use this Dataset, you should set num_works to 0 or it will raise unpickable error
     def __init__(
-        self, file: Union[h5py.File, str, dict], normalize=False, aug_prob=0.0
+        self,
+        file: Union[h5py.File, str, dict],
+        normalize=False,
+        aug_prob=0.0,
+        wavelets=False,
     ):
         super(HISRDataSets, self).__init__()
         # warning: you should not save file (h5py.File) in this class,
@@ -35,7 +40,24 @@ class HISRDataSets(data.Dataset):
                 "warning: when @file is a h5py.File object, it can not be pickled.",
                 "try to set DataLoader number_worker to 0",
             )
+        assert not normalize, '@normalize should be False'
+        
         self.gt, self.lr_hsi, self.rgb, self.hsi_up = self._split_parts(file, normalize)
+
+        self.wavelets = wavelets
+        if wavelets:
+            print("processing wavelets...")
+            hsi_up_main, (hsi_h, hsi_v, hsi_d) = pywt.wavedec2(
+                self.hsi_up, wavelet="db1", level=1, axes=(-2, -1)
+            )
+            rgb_main, (rgb_h, rgb_v, rgb_d) = pywt.wavedec2(
+                self.rgb, wavelet="db1", level=1, axes=(-2, -1)
+            )
+            print("done.")
+            self.wavelet_dcp = np.concatenate(
+                [hsi_up_main, rgb_h, rgb_v, rgb_d], axis=1
+            )
+
         self.size = self.gt.shape[-2:]
         print("dataset shape:")
         print("{:^20}{:^20}{:^20}{:^20}".format("lr_hsi", "hsi_up", "rgb", "gt"))
@@ -83,17 +105,17 @@ class HISRDataSets(data.Dataset):
             # load all data in memory
             if normalize:
                 return (
-                    torch.tensor(file["GT"], dtype=torch.float32) / 2047.0,
-                    torch.tensor(file["LRHSI"], dtype=torch.float32) / 2047.0,
-                    torch.tensor(file["RGB"], dtype=torch.float32) / 2047.0,
-                    torch.tensor(file["HSI_up"], dtype=torch.float32) / 2047.0,
+                    np.array(file["GT"][:], dtype=np.float32) / 2047.0,
+                    np.array(file["LRHSI"][:], dtype=np.float32) / 2047.0,
+                    np.array(file["RGB"][:], dtype=np.float32) / 2047.0,
+                    np.array(file["HSI_up"][:], dtype=np.float32) / 2047.0,
                 )
             else:
                 return (
-                    torch.tensor(file["GT"], dtype=torch.float32),
-                    torch.tensor(file["LRHSI"], dtype=torch.float32),
-                    torch.tensor(file["RGB"], dtype=torch.float32),
-                    torch.tensor(file["HSI_up"], dtype=torch.float32),
+                    np.array(file["GT"][:], dtype=np.float32),
+                    np.array(file["LRHSI"][:], dtype=np.float32),
+                    np.array(file["RGB"][:], dtype=np.float32),
+                    np.array(file["HSI_up"][:], dtype=np.float32),
                 )
         else:
             # warning: it will ignore @normalize
@@ -122,12 +144,21 @@ class HISRDataSets(data.Dataset):
 
         # harvard [rgb]
         # cave [bgr]
-        tuple_data = (
-            self.rgb[index],
-            # self.lr_hsi[index],
-            self.hsi_up[index],
-            self.gt[index],
-        )
+        if self.wavelets:
+            tuple_data = (
+                self.rgb[index],
+                # self.lr_hsi[index],
+                self.hsi_up[index],
+                self.gt[index],
+                self.wavelet_dcp[index],
+            )
+        else:
+            tuple_data = (
+                self.rgb[index],
+                # self.lr_hsi[index],
+                self.hsi_up[index],
+                self.gt[index],
+            )
         if self.aug_prob != 0.0:
             return self.aug_trans(*tuple_data)
         else:

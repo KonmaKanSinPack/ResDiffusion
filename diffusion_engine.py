@@ -1,4 +1,3 @@
-from ast import Not
 from functools import partial
 import time
 from copy import deepcopy
@@ -16,11 +15,10 @@ import torch.nn.functional as F
 
 from dataset.pan_dataset import PanDataset
 from dataset.hisr import HISRDataSets
-from diffusion.diffusion_ddpm_google import make_beta_schedule
-from models.diffusion_res import ShiftDiffusion, make_sqrt_etas_schedule
+from diffusion.diffusion_ddpm_pan import make_beta_schedule
 from utils.logger import TensorboardLogger
 from utils.lr_scheduler import get_lr_from_optimizer, StepsAll
-from utils.metric import AnalysisPanAcc
+from utils.metric import AnalysisPanAcc, NonAnalysisPanAcc
 from utils.misc import compute_iters, exist, grad_clip, model_load, path_legal_checker
 from utils.optim_utils import EmaUpdater
 import os
@@ -51,31 +49,6 @@ def clamp_fn(g_sr):
 
     return inner
 
-def save_fig(l,r,rgb_channel,path):
-    hr = tv.utils.make_grid(l, nrow=4, padding=0).cpu()
-    x = tv.utils.make_grid(r, nrow=4, padding=0).detach().cpu()
-    hr = hr.clip(0,1)
-    x = x.clip(0, 1)
-
-    s = torch.cat([hr, x], dim=-1)  # [b, c, h, 2*w]
-    fig, ax = plt.subplots(
-        figsize=(s.shape[-1] // 100, s.shape[-2] // 100)
-    )
-    ax.imshow(
-        s.permute(1, 2, 0)
-        .detach()
-        .numpy()[..., rgb_channel]
-    )
-    ax.set_axis_off()
-
-    # plt.show()
-    plt.tight_layout(pad=0)
-    fig.savefig(
-        path,
-        dpi=200,
-        bbox_inches="tight",
-        pad_inches=0,
-    )
 
 def engine_google(
     # dataset
@@ -102,7 +75,6 @@ def engine_google(
     # just for debugging
     constrain_channel=None,
 ):
-    print(show_recon)
     """train and valid function
 
     Args:
@@ -119,16 +91,12 @@ def engine_google(
         show_recon (bool, optional): _description_. Defaults to False.
         constrain_channel (int, optional): _description_. Defaults to None.
     """
-    # from diffusion.continous_ddpm import GaussianDiffusion
-    from diffusion.diffusion_ddpm_google import GaussianDiffusion
-    # from models.sr3 import UNetSR3 as Unet
+    from diffusion.diffusion_ddpm_pan import GaussianDiffusion
     from models.sr3_dwt import UNetSR3 as Unet
-    from models.buffer_layer import ResBlock
-    # from models.med_fft_unt import Unet
 
     # init logger
-    stf_time = time.strftime("%m-%d %H:%M", time.localtime())
-    comment = "ddpm_wv3"
+    stf_time = time.strftime("%m-%d_%H-%M", time.localtime())
+    comment = "pandiff"
     logger = TensorboardLogger(file_logger_name="{}-{}".format(stf_time, comment))
 
     dataset_name = (
@@ -137,22 +105,20 @@ def engine_google(
         else dataset_name
     )
     logger.print(f"dataset name: {dataset_name}")
-    division_dict = {"wv3": 2047.0, "gf2": 1023.0, "qb": 2047.0, "cave": 1.0}
+    division_dict = {"wv3": 2047.0, "gf2": 1023.0, "qb": 2047.0, "cave": 1.0, "harvard": 1.0}
     logger.print(f"dataset norm division: {division_dict[dataset_name]}")
     rgb_channel = {
         "wv3": [4, 2, 0],
         "gf2": [0, 1, 2],
         "qb": [0, 1, 2],
-        "cave": [2, 4, 6],
+        "cave": [29, 19, 9],
+        "harvard": [29, 19, 9]
     }
     logger.print(f"rgb channel: {rgb_channel[dataset_name]}")
     add_n_channel = 1
 
     # initialize models
     torch.cuda.set_device(device)
-
-    res_model = ResBlock(image_n_channel,image_n_channel,0.2,norm_groups=8).to(device)
-
     denoise_fn = Unet(
         in_channel=image_n_channel,
         out_channel=image_n_channel,
@@ -160,18 +126,18 @@ def engine_google(
         pan_channel=add_n_channel,
         inner_channel=32,
         norm_groups=1,
-        channel_mults=(1, 2, 2, 4),  # (64, 32, 16, 8)
+        channel_mults=(1,2,2,4),#(1, 2, 2, 4),  # (64, 32, 16, 8)
         attn_res=(8,),
         dropout=0.2,
         image_size=64,
-           self_condition=True,
+        self_condition=True,
     ).to(device)
     if pretrain_weight is not None:
         if isinstance(pretrain_weight, (list, tuple)):
             model_load(pretrain_weight[0], denoise_fn, strict=True, device=device)
-            # model_load(pretrain_weight[1], guidance_net, strict=True, device=device)
         else:
-            model_load(pretrain_weight, denoise_fn, strict=True, device=device)
+            model_load(pretrain_weight, denoise_fn, strict=False, device=device)
+        print("load pretrain weight from {}".format(pretrain_weight))
 
     # get dataset
     d_train = h5py.File(train_dataset_path)
@@ -186,25 +152,16 @@ def engine_google(
             aug_prob=0,
             wavelets=True,
         )
-    elif dataset_name == "cave":
-        DatasetUsed = partial(HISRDataSets, normalize=False, aug_prob=0)
+    elif dataset_name in ["cave", "harvard"]:
+        DatasetUsed = partial(HISRDataSets, normalize=False, aug_prob=0, wavelets=True)
     else:
         raise NotImplementedError("dataset {} not supported".format(dataset_name))
 
     ds_train = DatasetUsed(
         d_train,
-        # full_res=False,
-        # norm_range=False,
-        # constrain_channel=constrain_channel,
-        # division=division_dict[dataset_name],
-        # aug_prob=0,
     )
     ds_valid = DatasetUsed(
         d_valid,
-        # full_res=False,
-        # norm_range=False,
-        # constrain_channel=constrain_channel,
-        # division=division_dict[dataset_name],
     )
     dl_train = DataLoader(
         ds_train,
@@ -216,7 +173,7 @@ def engine_google(
     )
     dl_valid = DataLoader(
         ds_valid,
-        batch_size=batch_size,
+        batch_size=16,
         shuffle=True,
         pin_memory=True,
         num_workers=0,
@@ -224,66 +181,35 @@ def engine_google(
     )
 
     # diffusion
-    # diffusion = GaussianDiffusion(
-    #     denoise_fn,
-    #     image_size=image_size,
-    #     channels=image_n_channel,
-    #     # num_sample_steps=n_steps,
-    #     pred_mode="x_start",
-    #     loss_type="l1",
-    #     device=device,
-    #     clamp_range=(0, 1),
-    # )
-    # diffusion.set_new_noise_schedule(
-    #     betas=make_beta_schedule(schedule="cosine", n_timestep=n_steps, cosine_s=8e-3)
-    # )
-
-    # diffusion = ShiftDiffusion(
-    #     denoise_fn,
-    #     #self.autoencoder,
-    #     channels=image_n_channel,
-    #     # num_sample_steps=n_steps,
-    #     pred_mode="x_start",
-    #     loss_type="l2",
-    #     device=device,
-    #     clamp_range=(0, 1),
-    # ).cuda()
-    diffusion = ShiftDiffusion(
+    diffusion = GaussianDiffusion(
         denoise_fn,
-        #self.autoencoder,
+        image_size=image_size,
         channels=image_n_channel,
         # num_sample_steps=n_steps,
         pred_mode="x_start",
-        loss_type="l2",
+        loss_type="l1",
         device=device,
         clamp_range=(0, 1),
-    ).cuda()
-    diffusion.set_new_noise_schedule(
-        sqrt_etas=make_sqrt_etas_schedule(n_timestep=n_steps)
     )
-
+    diffusion.set_new_noise_schedule(
+        betas=make_beta_schedule(schedule="cosine", n_timestep=n_steps, cosine_s=8e-3)
+    )
     diffusion = diffusion.to(device)
 
     # model, optimizer and lr scheduler
     diffusion_dp = (
-        # nn.DataParallel(diffusion, device_ids=[0, 1], output_device=device)
         diffusion
     )
     ema_updater = EmaUpdater(
         diffusion_dp, deepcopy(diffusion_dp), decay=0.995, start_iter=20_000
     )
-    opt_r = torch.optim.AdamW(res_model.parameters(), lr=lr_d,weight_decay=1e-4)
     opt_d = torch.optim.AdamW(denoise_fn.parameters(), lr=lr_d, weight_decay=1e-4)
-    # opt_g = torch.optim.AdamW(guidance_net.parameters(), lr=1e-4, weight_decay=1e-3)
 
     scheduler_d = torch.optim.lr_scheduler.MultiStepLR(
-        opt_d, milestones=[60_000, 100_000, 150_000], gamma=0.2
+        opt_d, milestones=[100_000, 200_000, 350_000], gamma=0.2
     )
-    # scheduler_g = torch.optim.lr_scheduler.MultiStepLR(
-    #     opt_g, milestones=[100_000, 200_000, 300_000], gamma=0.05
-    # )
     schedulers = StepsAll(scheduler_d)
-    loss_mse = torch.nn.MSELoss()
+
     # training
     if pretrain_iterations is not None:
         iterations = pretrain_iterations
@@ -293,43 +219,25 @@ def engine_google(
     while iterations <= max_iterations:
         for i, (pan, lms, hr, wavelets) in enumerate(dl_train, 1):
             pan, lms, hr, wavelets = map(lambda x: x.cuda(), (pan, lms, hr, wavelets))
-            cond, _ = einops.pack([lms, pan, F.interpolate(wavelets, size=lms.shape[-1], mode='bilinear')], "b * h w")
-
-            #opt_r.zero_grad()
-            opt_d.zero_grad()
-
-            e_0 = hr - lms
-            # cond[:, :image_n_channel] = g_sr
-
-            # T = torch.full((e_0.size(0),), n_steps - 1, device=device, dtype=torch.long)
-            # e_T = diffusion_dp.q_sample(e_0,T)
-            # noise = torch.randn_like(e_T, device=device)
-            # z_sample = diffusion_dp.prior_sample(lms, noise) #x_T
-            # z_sample = diffusion_dp.model.forward(z_sample, T, cond, self_cond=None)
-            # e_T_pred = diffusion_dp.q_sample(z_sample, T)
-            # #print(f"e_T:{e_T.max()}")
-            # #print(e_T.mean())
-            # #print(f"e_T_pred:{(e_T_pred-e_T).mean()}")
-            # #print(e_T_pred.mean())
-            # save_fig(e_T,e_T_pred,rgb_channel[dataset_name],"./samples/comp_e_T.png")
-
-            diff_loss, recon_x = diffusion_dp(x=hr, y=lms, cond=cond)
-            #res_loss = loss_mse(e_T_pred,e_T)
-
-            #res_loss.backward()
-            diff_loss.backward()
-            #recon_x = recon_x + lms
-
-            # do a grad clip on diffusion model
-            grad_clip(
-                diffusion_dp.model.parameters(),
-                mode="norm",
-                value=0.003,
+            cond, _ = einops.pack(
+                [
+                    lms,
+                    pan,
+                    F.interpolate(wavelets, size=lms.shape[-1], mode="bilinear"),
+                ],
+                "b * h w",
             )
 
-            opt_r.step()
+            opt_d.zero_grad()
+            res = hr - lms
+            diff_loss, recon_x = diffusion_dp(res, cond=cond)
+            diff_loss.backward()
+            recon_x = recon_x + lms
+
+            # do a grad clip on diffusion model
+            grad_clip(diffusion_dp.model.parameters(), mode="norm", value=0.003)
+
             opt_d.step()
-            # opt_g.step()
             ema_updater.update(iterations)
             schedulers.step()
 
@@ -339,101 +247,89 @@ def engine_google(
             #     + f"d_lr {get_lr_from_optimizer(opt_d): .6f}] - "
             #     + f"denoise loss {diff_loss:.6f} "
             # )
-            # if iterations %1000 == 0:
-            #     save_fig(e_T,e_T_pred,rgb_channel[dataset_name],f"./samples/e_T/iter_{iterations}.png")
-            #     print(e_0.max())
-            #     print(e_T.max())
-            #     print(e_T_pred.max())
-            #     logger.print(f"res_loss:{res_loss}")
 
             # test predicted sr
-            if show_recon and iterations % 1000 == 0:
+            if show_recon and iterations % 1_000 == 0:
                 # NOTE: only used to validate code
-                print(f"minus_recon:{(e_0-recon_x).mean()}")
-                analysis_d = AnalysisPanAcc()
-                analysis_d(hr, recon_x+lms)
-                # analysis_g(hr, g_sr)
+                recon_x = recon_x[:64]
 
-                logger.print("---recon result---")
-                logger.print(analysis_d.last_acc)
-                save_fig(e_0,recon_x,rgb_channel[dataset_name],f"./samples/recon_x/recon_{iterations}.png")
-                save_fig(hr, recon_x+lms, rgb_channel[dataset_name], f"./samples/recon_x/img_{iterations}.png")
-                logger.print("Finished")
-                # recon_x = recon_x[:64]
-                #
-                # x = tv.utils.make_grid(recon_x, nrow=8, padding=0).cpu()
-                # x = x.clip(0, 1)  # for no warning
-                # fig, ax = plt.subplots(figsize=(x.shape[-1] // 100, x.shape[-2] // 100))
-                # x_show = (
-                #     x.permute(1, 2, 0).detach().numpy()[..., rgb_channel[dataset_name]]
-                # )
-                # ax.imshow(x_show)
-                # ax.set_axis_off()
-                # plt.tight_layout(pad=0)
-                # # plt.show()
-                # fig.savefig(
-                #     f"./samples/recon_x/iter_{iterations}.png",
-                #     dpi=200,
-                #     bbox_inches="tight",
-                #     pad_inches=0,
-                # )
+                x = tv.utils.make_grid(recon_x, nrow=8, padding=0).cpu()
+                x = x.clip(0, 1)  # for no warning
+                fig, ax = plt.subplots(figsize=(x.shape[-1] // 100, x.shape[-2] // 100))
+                x_show = (
+                    x.permute(1, 2, 0).detach().numpy()[..., rgb_channel[dataset_name]]
+                )
+                ax.imshow(x_show)
+                ax.set_axis_off()
+                plt.tight_layout(pad=0)
+                # plt.show()
+                fig.savefig(
+                    f"./samples/recon_x/iter_{iterations}.png",
+                    dpi=200,
+                    bbox_inches="tight",
+                    pad_inches=0,
+                )
 
             # do some sampling to check quality
             if iterations % 1000 == 0:
-
                 diffusion_dp.model.eval()
                 ema_updater.ema_model.model.eval()
-                # guidance_net.eval()
-                # setattr(ema_updater.ema_model, "image_size", 256)
-                # diffusion_dp.reset_logsnr(
-                #     noise_d=None, noise_d_low=64, noise_d_high=256
-                # )
 
                 analysis_d = AnalysisPanAcc()
-                # analysis_g = AnalysisPanAcc()
                 with torch.no_grad():
                     for i, (pan, lms, hr, wavelets) in enumerate(dl_valid, 1):
-                        pan, lms, hr, wavelets = map(lambda x: x.cuda(), (pan, lms, hr, wavelets))
+                        torch.cuda.empty_cache()
+                        pan, lms, hr, wavelets = map(
+                            lambda x: x.cuda(), (pan, lms, hr, wavelets)
+                        )
 
-                        cond, _ = einops.pack([lms, pan, F.interpolate(wavelets, size=lms.shape[-1], mode='bilinear')], "b * h w")
+                        cond, _ = einops.pack(
+                            [
+                                lms,
+                                pan,
+                                F.interpolate(
+                                    wavelets, size=lms.shape[-1], mode="bilinear"
+                                ),
+                            ],
+                            "b * h w",
+                        )
 
-                        # g_sr = guidance_net(cond)
-                        # clamp_diff_fn = clamp_fn(g_sr)
-                        # ema_updater.ema_model.set_clamp_fn(clamp_diff_fn)
-                        # cond[:, :image_n_channel] = g_sr
-                        # sr = ema_updater.ema_model(
-                        #     cond, mode='ddpm_sample'
-                        # )
-                        # sr = ema_updater.ema_model.sample(batch_size=cond.shape[0],
-                        #                                   cond=cond)
-                        # sr = sr + g_sr
-                        #e_T_pred = res_model(lms)
-                        sr = ema_updater.ema_model(y=lms,cond=cond, mode="ddpm_sample")
-                        save_fig(hr-lms,sr,[4,2,0],"./samples/com_e_o.png")
-                        print(f"minus:{(hr-lms-sr).mean()}")
-                        #sr=sr.clamp(0,1)
+                        sr = ema_updater.ema_model(cond, mode="ddpm_sample")
                         sr = sr + lms
+                        sr = sr.clip(0, 1)
 
                         hr = hr.to(sr.device)
                         analysis_d(hr, sr)
-                        # analysis_g(hr, g_sr)
+                        
+                        hr = tv.utils.make_grid(hr, nrow=4, padding=0).cpu()
+                        x = tv.utils.make_grid(sr, nrow=4, padding=0).detach().cpu()
+                        x = x.clip(0, 1)
 
-                        save_fig(hr,sr,rgb_channel[dataset_name],f"./samples/valid_samples/iter_{iterations}.png")
+                        s = torch.cat([hr, x], dim=-1)  # [b, c, h, 2*w]
+                        fig, ax = plt.subplots(
+                            figsize=(s.shape[-1] // 100, s.shape[-2] // 100)
+                        )
+                        ax.imshow(
+                            s.permute(1, 2, 0)
+                            .detach()
+                            .numpy()[..., rgb_channel[dataset_name]]
+                        )
+                        ax.set_axis_off()
+
+                        plt.tight_layout(pad=0)
+                        fig.savefig(
+                            f"./samples/valid_samples/iter_{iterations}.png",
+                            dpi=200,
+                            bbox_inches="tight",
+                            pad_inches=0,
+                        )
                         logger.print("---diffusion result---")
                         logger.print(analysis_d.last_acc)
-                        # logger.print(analysis_g.last_acc)
-                        break
                     if i != 1:
                         logger.print("---diffusion result---")
                         logger.print(analysis_d.print_str())
-                        # logger.print(analysis_g.print_str())
-
                 diffusion_dp.model.train()
-                # guidance_net.train()
                 setattr(ema_updater.model, "image_size", 64)
-                # diffusion_dp.reset_logsnr(
-                #     noise_d=None, noise_d_low=None, noise_d_high=None
-                # )
 
                 torch.save(
                     ema_updater.on_fly_model_state_dict,
@@ -443,14 +339,9 @@ def engine_google(
                     ema_updater.ema_model_state_dict,
                     f"./weights/ema_diffusion_{dataset_name}_iter_{iterations}.pth",
                 )
-                # torch.save(
-                #     guidance_net.state_dict(),
-                #     f"./weights/guidance_net_{dataset_name}_iter_{iterations}.pth",
-                # )
                 logger.print("save model")
 
                 logger.log_scalars("diffusion_perf", analysis_d.acc_ave, iterations)
-                # logger.log_scalars("guidance_net_perf", analysis_g.acc_ave, iterations)
                 logger.print("saved performances")
 
             # log loss
@@ -472,63 +363,43 @@ def test_fn(
     division=1023,
 ):
     # lazy import
-    # from diffusion.diffusion_ddpm_google import GaussianDiffusion
-
-    # from models.unet_model_google import UNet
-    # from models.sr3 import UNetSR3 as UNet
-    from diffusion.elucidated_diffusion import ElucidatedDiffusion
-    from models.uvit import UViT
-    from models.sr3 import UNetSR3 as Unet
-    from diffusion.diffusion_ddpm_google import GaussianDiffusion
+    from models.sr3_dwt import UNetSR3 as Unet
+    from diffusion.diffusion_ddpm_pan import GaussianDiffusion
 
     torch.cuda.set_device(device)
 
     # load model
-    image_n_channel = 4
-    image_size = 256
-    # denoise_fn = UViT(
-    #     64,
-    #     out_dim=8,
-    #     channels=17,
-    #     attn_dim_head=8,
-    #     dual_patchnorm=True,
-    # ).to(device)
+    if dataset_name in ['harvard', 'cave']:
+        image_n_channel = 31
+        image_size = 512 if dataset_name == 'cave' else 1000
+        pan_channel = 3
+        rgb_channels = [39, 19, 9]
+    elif dataset_name in ['wv3', 'gf2', 'qb']:
+        image_size = 512 if full_res else 256
+        image_n_channel = 8 if dataset_name == 'wv3' else 4
+        pan_channel = 1
+        rgb_channels = [4, 2, 0] if dataset_name == 'wv3' else [2, 1, 0]
     denoise_fn = Unet(
         in_channel=image_n_channel,
         out_channel=image_n_channel,
-        cond_channel=image_n_channel + 1,
-        norm_groups=32,
+        lms_channel=image_n_channel,
+        pan_channel=pan_channel,#1,
+        inner_channel=32,  # 32,
+        norm_groups=1,
         channel_mults=(1, 2, 2, 4),  # (64, 32, 16, 8)
         attn_res=(8,),
         dropout=0.2,
         image_size=64,
         self_condition=True,
     ).to(device)
-    # guidance_fn = GuidanceNetwork(spectral_num=image_n_channel).to(device)
     denoise_fn = model_load(weight_path, denoise_fn, device=device)
-    # guidance_fn = model_load(weight_path[1], guidance_fn, device=device)
 
     denoise_fn.eval()
-    # guidance_fn.eval()
     print(f"load weight {weight_path}")
-    # schedule = dict(
-    #     schedule=schedule_type,
-    #     n_timestep=n_steps,
-    #     linear_start=1e-4,
-    #     linear_end=2e-2,
-    #     cosine_s=8e-3,
-    # )
-    # diffusion = ElucidatedDiffusion(
-    #     denoise_fn,
-    #     image_size=image_size,
-    #     channels=image_n_channel,
-    #     num_sample_steps=n_steps,
-    # )
     diffusion = GaussianDiffusion(
         denoise_fn,
         image_size=image_size,
         channels=image_n_channel,
-        # num_sample_steps=n_steps,
         pred_mode="x_start",
         loss_type="l1",
         device=device,
@@ -538,37 +409,47 @@ def test_fn(
         betas=make_beta_schedule(schedule="cosine", n_timestep=n_steps, cosine_s=8e-3)
     )
     diffusion = diffusion.to(device)
-    # diffusion = nn.DataParallel(diffusion, device_ids=[0, 1], output_device=device)
-    # guidance_fn = nn.DataParallel(guidance_fn, device_ids=[0, 1], output_device=device)
 
     # load dataset
     d_test = h5py.File(test_data_path)
-    ds_test = PanDataset(d_test, full_res=full_res, norm_range=False, division=division)
+    if dataset_name in ["wv3", "gf2", "qb"]:
+        ds_test = PanDataset(
+            d_test, full_res=full_res, norm_range=False, division=division, wavelets=True
+        )
+    else:
+        ds_test = HISRDataSets(
+            d_test, normalize=False, aug_prob=0.0, wavelets=True
+        )
+        
     dl_test = DataLoader(
-        ds_test, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=0
-    )
+            ds_test, batch_size=batch_size, shuffle=False, pin_memory=True, num_workers=0
+        )
 
     saved_name = "reduced" if not full_res else "full"
 
     # do sampling
     preds = []
-    sample_times = compute_iters(dl_test.dataset.size, batch_size, dl_test.drop_last)
-    analysis = AnalysisPanAcc()
-    # for i, (pan, _, lms, hr) in enumerate(dl_test, 1):
-    # for i, (pan, lms, gt) in enumerate(dl_test):
-    for i, (pan, lms) in enumerate(dl_test):
+    sample_times = len(dl_test)
+    analysis = AnalysisPanAcc() if not full_res else NonAnalysisPanAcc()
+    for i, batch in enumerate(dl_test):
+        if full_res:
+            pan, lms, wavelets = batch
+            gt = None
+        else:
+            pan, lms, gt, wavelets = batch
         print(f"sampling [{i}/{sample_times}]")
-        cond = torch.cat([lms, pan], dim=1).to(device)
-        # pre_recon = guidance_fn(cond, mode="val")
-        sr = diffusion(cond, mode="ddpm_sample")
+        pan, lms, wavelets = map(lambda x: x.cuda(), (pan, lms, wavelets))
+        cond, _ = einops.pack(
+            [lms, pan, F.interpolate(wavelets, size=lms.shape[-1], mode="bilinear")],
+            "b * h w",
+        )
+        sr = diffusion(cond, mode="ddim_sample", section_counts="ddim25")
         sr = sr + lms.cuda()
-        # sr = sr + pre_recon
-        # sr = unorm(sr.detach().cpu())  # [0, 1]
-        # hr = unorm(hr)
+        sr = sr.clip(0, 1)
 
-        # analysis(sr.detach().cpu(), gt)
+        analysis(sr.detach().cpu(), gt)
 
-        # print(analysis.last_acc)
+        print(analysis.print_str(analysis.last_acc))
 
         if show:
             # hr = hr.detach().clone()[:64]
@@ -580,14 +461,14 @@ def test_fn(
             fig, ax = plt.subplots(
                 figsize=(s.shape[2] // 100, s.shape[1] // 100), dpi=200
             )
-            ax.imshow(s.permute(1, 2, 0).detach().numpy()[..., [0, 1, 2]])
+            ax.imshow(s.permute(1, 2, 0).detach().numpy()[..., rgb_channels])
             ax.set_axis_off()
 
             # plt.tight_layout()
             # plt.show()
             fig.savefig(
                 path_legal_checker(
-                    f"./samples/{dataset_name}_test/test_sample_iter_{n_steps}_{saved_name}_part_{i}.png"
+                    f"./samples/pandiff_{dataset_name}_test/test_sample_iter_{n_steps}_{saved_name}_part_{i}.png"
                 ),
                 dpi=200,
                 bbox_inches="tight",
@@ -599,7 +480,7 @@ def test_fn(
         preds.append(sr.clip(0, division))
         # preds.append(sr)
 
-        # print(f"test acc:\n {analysis.print_str()}")
+        print(f"over all test acc:\n {analysis.print_str()}")
 
     # save results
     if not full_res:
@@ -617,57 +498,38 @@ def test_fn(
             pan=d_test["pan"][:],
             sr=np.concatenate(preds, axis=0),
         )
-    model_iterations = weight_path[0].split("_")[-1].strip(".pth")
+    model_iterations = weight_path.split("_")[-1].strip(".pth")
     savemat(
-        f"./samples/mat/test_iter_{model_iterations}_{saved_name}_{dataset_name}.mat", d
+        path_legal_checker(f"./samples/mat/test_iter_{model_iterations}_{saved_name}_{dataset_name}.mat"), 
+        d
     )
     print("save result")
 
 
-# torch.cuda.set_device(1)
+torch.cuda.set_device(0)
 engine_google(
     "data/wv3/train_wv3.h5",
     "data/wv3/valid_wv3.h5",
-    # "/home/ZiHanCao/datasets/pansharpening/gf/training_gf2/train_gf2.h5",
-    # "/home/ZiHanCao/datasets/pansharpening/gf/reduced_examples/test_gf2_multiExm1.h5",
-    # "/home/wutong/proj/HISR/x4/train_cave(with_up)x4_rgb.h5",
-    # "/home/wutong/proj/HISR/x4/test_cave(with_up)x4_rgb.h5",
     dataset_name="wv3",
-    pretrain_weight="weights/ema_diffusion_wv3_iter_49000.pth",
-    # pretrain_iterations=51000,
-    show_recon=True ,
+    show_recon=False,
     lr_d=1e-4,
-    n_steps=15,
+    n_steps=500,
     schedule_type="cosine",
     batch_size=64,
     device="cuda:0",
-    max_iterations=300_000,
+    max_iterations=400_000,
     image_n_channel=8,
-    # pretrain_iterations=6000,
-    # pretrain_weight='./weights/ema_diffusion_cave_iter_6000.pth',
+    # pretrain_iterations=0,
 )
 
-# WV3: 21000
-# GF2: 27000
-# QB: 27000
-
-# test_fn(
-#     # "/home/wutong/proj/HJM_Pansharpening/Pansharpening_new data/test data/h5/WV3/reduce_examples/test_wv3_multiExm1.h5", # raw reduce test data, size 256
-#     # "/home/wutong/proj/HJM_Pansharpening/Pansharpening_new data/test data/h5/GF2/reduce_examples/test_gf2_multiExm1.h5",
-#     # "/home/wutong/proj/HJM_Pansharpening/Pansharpening_new data/test data/h5/WV3/full_examples/test_wv3_OrigScale_multiExm1.h5",
-#     "/home/wutong/proj/HJM_Pansharpening/Pansharpening_new data/test data/h5/QB/full_examples/test_qb_OrigScale_multiExm1.h5",
-#     # "/home/wutong/proj/HJM_Pansharpening/Pansharpening_new data/test data/h5/GF2/full_examples/test_gf2_OrigScale_multiExm1.h5",
-#     # orig scale test data, size 512
-#     # "/home/ZiHanCao/datasets/pansharpening/pansharpening_test/test_gf2_OrigScale_multiExm1.h5",
-#     # "/home/ZiHanCao/datasets/pansharpening/pansharpening_test/test_qb_OrigScale_multiExm1.h5",
-#     # './clip_org_scale_test_wv3/clip_test_wv3.h5',  # clipped data, size 64
-#     # ["./weights/ema_diffusion_gf2_iter_27000.pth", "./weights/guidance_gf2_iter_27000.pth"],
-#     "./weights/ema_diffusion_qb_iter_21000.pth",
-#     batch_size=10,
-#     n_steps=500,
-#     show=True,
-#     dataset_name="qb",
-#     division=2047.0,
-#     full_res=True,
-#     device="cuda:1",
-# )
+torch.cuda.set_device(0)
+test_fn(
+    "YOUR DATA PATH HERE",
+    batch_size=1,
+    n_steps=25, #500,
+    show=True,
+    dataset_name="gf2",
+    division=1023.0,
+    full_res=False,
+    device="cuda:1",
+)

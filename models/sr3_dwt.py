@@ -685,25 +685,49 @@ def default(val, d):
 
 if __name__ == "__main__":
     from fvcore.nn import FlopCountAnalysis, flop_count_table
+    
+    # context to test runtime
+    import contextlib
+    import time
+    
+    @contextlib.contextmanager
+    def time_it(t=10):
+        t1 = time.time()
+        yield
+        t2 = time.time()
+        print('total time: {}, ave time: {:.3f}s'.format((t2-t1), (t2 - t1)/t))
+        
+    device = 'cuda:1'
 
     net = UNetSR3(
-        in_channel=8,
-        channel_mults=(1, 2, 2, 4),
+        in_channel=31,
+        channel_mults=(1, 2, 2, 2),
         out_channel=8,
         lms_channel=8,
         pan_channel=1,
         image_size=64,
         self_condition=False,
         inner_channel=32,
-        norm_groups=32,
+        norm_groups=1,
         attn_res=(8,),
         dropout=0.2,
-    )
-    x = torch.randn(1, 8, 64, 64)
-    cond = torch.randn(1, 8 + 1 + 8 + 3, 64, 64)  # [lms, pan, lms_main, h, v, d]
-    t = torch.LongTensor([1])
-    # y = net(x, t, cond)
+    ).to(device)
+    x = torch.randn(1, 31, 512, 512).to(device)
+    cond = torch.randn(1, 31 + 1 + 31 + 3, 512, 512).to(device)  # [lms, pan, lms_main, h, v, d]
+    t = torch.LongTensor([1]).to(device)
+    
+    with torch.no_grad():
+        y = net(x, t, cond)
+        tt = 25
+        with time_it(tt):
+            for _ in range(tt):
+                y = net(x, t, cond)
+                
+
+        
+    
+    
     # print(y.shape)
 
-    print(flop_count_table(FlopCountAnalysis(net, (x, t, cond))))
+    # print(flop_count_table(FlopCountAnalysis(net, (x, t, cond))))
     

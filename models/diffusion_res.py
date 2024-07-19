@@ -260,6 +260,11 @@ class ShiftDiffusion(nn.Module):
         posterior_variance_clipped = np.append(
             posterior_variance[1], posterior_variance[1:]
         )
+        posterior_mean_coef1 = etas_prev / etas
+        posterior_mean_coef2 = alphas / etas
+        self.register_buffer("posterior_mean_coef1", to_torch(posterior_mean_coef1))
+        self.register_buffer("posterior_mean_coef2", to_torch(posterior_mean_coef2))
+
         self.register_buffer("posterior_variance_clipped", to_torch(posterior_variance_clipped))
         posterior_log_variance_clipped = np.log(posterior_variance_clipped)
         self.register_buffer("posterior_log_variance_clipped", to_torch(posterior_log_variance_clipped))
@@ -343,10 +348,14 @@ class ShiftDiffusion(nn.Module):
 
     def q_posterior(self, x_start, x_t, t):
         #η_{t-1}/η_{t}*x_{t}+α_{t}/η_{t}*x_{0}     //+k^{2}*η_{t-1}/η_{t}*α_{t}*ε
+        # posterior_mean = (
+        #         extract(self.etas, t-1, x_t.shape)/extract(self.etas, t, x_t.shape)* x_t
+        #         + extract(self.alphas, t, x_t.shape)/extract(self.etas, t, x_t.shape) * x_start
+        #         #+ self.kappa**2*extract(self.etas, t-1, x_t.shape)/extract(self.etas, t, x_t.shape)*extract(self.alphas, t, x_t.shape)*
+        # )
         posterior_mean = (
-                extract(self.etas, t-1, x_t.shape)/extract(self.etas, t, x_t.shape)* x_t
-                + extract(self.alphas, t, x_t.shape)/extract(self.etas, t, x_t.shape) * x_start
-                #+ self.kappa**2*extract(self.etas, t-1, x_t.shape)/extract(self.etas, t, x_t.shape)*extract(self.alphas, t, x_t.shape)*
+                extract(self.posterior_mean_coef1, t, x_t.shape) * x_t
+                + extract(self.posterior_mean_coef2, t, x_t.shape) * x_start
         )
         posterior_variance = extract(self.posterior_variance, t, x_t.shape)
         posterior_log_variance_clipped = extract(
@@ -526,11 +535,14 @@ class ShiftDiffusion(nn.Module):
                 b = x.shape[0]
             #img = x_in
             #ret_img = img
-            for i in tqdm(
-                    reversed(range(1, self.num_timesteps)),
-                    desc="sampling loop time step",
-                    total=self.num_timesteps-1,
-            ):
+            # for i in tqdm(
+            #         reversed(range(1, self.num_timesteps)),
+            #         desc="sampling loop time step",
+            #         total=self.num_timesteps-1,
+            # ):
+
+            length = list(range(self.num_timesteps))[::-1]
+            for i in tqdm(length):
                 self_cond = x_start if self.self_condition else None
                 res = self.p_sample(
                     e_t=z_sample,
@@ -546,9 +558,11 @@ class ShiftDiffusion(nn.Module):
                     ret_img = torch.cat([x_in+res, x_in], dim=0)
                 x_start = res
 
+            self_cond = res
             res = self.model.forward(res+x_in,
                                       torch.full((b,), 0, device=device, dtype=torch.long),
                                       x, self_cond=self_cond)
+
 
 
         if continous:
@@ -768,7 +782,7 @@ class ShiftDiffusion(nn.Module):
         #         _extract_into_tensor(self.etas, t, x_start.shape) * (y - x_start) + x_start
         #         + _extract_into_tensor(self.sqrt_etas * self.kappa, t, x_start.shape) * noise
         # )
-        #return extract(self.etas, t, x_start.shape)*e_0 + x_start + self.kappa**2*extract(self.etas, t, x_start.shape) * noise
+        #return extract(self.etas, t, x_start.shape)*e_0 + x_start + self.kappa*extract(self.sqrt_etas, t, x_start.shape) * noise
         return e_0 - extract(self.etas, t, e_0.shape) * e_0 + extract(self.kappa*self.sqrt_etas, t,e_0.shape) * noise
 
 

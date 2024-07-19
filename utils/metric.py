@@ -8,6 +8,17 @@ from .misc import dict_to_str
 from ._metric_legacy import analysis_accu
 
 
+class NonAnalysisPanAcc(object):
+    def __call__(self, *args, **kwargs):
+        self._acc_d = {}
+        self._call_n = 0
+        self.acc_ave = {}
+        self.last_acc = {}
+
+    def print_str(*args, **kwargs):
+        print("full res: no supervised acc")
+
+
 # FIXME: this python code is not same as matlab code, you should use matlab code to get the real accuracy
 # only used in training and validate
 class AnalysisPanAcc(object):
@@ -126,11 +137,24 @@ def psnr_batch_tensor_metric(b_gt, b_test):
     return psnr / bs
 
 
+# def ssim_one_image(img_gt, img_test, channel_axis=0):
+#     assert (
+#         img_gt.shape == img_test.shape
+#     ), "image 1 and image 2 should have the same size"
+#     # return structural_similarity(img_gt, img_test, channel_axis=channel_axis, data_range=1.)
+#     return structural_similarity(
+#         img_gt.transpose(1, 2, 0),
+#         img_test.transpose(1, 2, 0),
+#         data_range=1.0,
+#         multichannel=True,
+#     )
+
+
 def ssim_one_image(img_gt, img_test, channel_axis=0):
     assert (
         img_gt.shape == img_test.shape
     ), "image 1 and image 2 should have the same size"
-    return structural_similarity(img_gt, img_test, channel_axis=channel_axis, data_range=1.)
+    return structural_similarity(img_gt, img_test, channel_axis=channel_axis,data_range=1)
 
 
 def ssim_batch_tensor_metric(b_gt, b_test):
